@@ -13,6 +13,7 @@ import com.lianyi.paimonsnotebook.common.database.PaimonsNotebookDatabase
 import com.lianyi.paimonsnotebook.common.database.abyss.entity.AbyssSeasonSnapshot
 import com.lianyi.paimonsnotebook.common.database.user.util.AccountHelper
 import com.lianyi.paimonsnotebook.common.extension.scope.launchSafeIO
+import com.lianyi.paimonsnotebook.common.util.abyss.AbyssNavigation
 import com.lianyi.paimonsnotebook.common.util.metadata.genshin.abyss.AbyssSnapshotMapper
 import com.lianyi.paimonsnotebook.common.extension.intent.setComponentName
 import com.lianyi.paimonsnotebook.common.extension.string.errorNotify
@@ -46,18 +47,61 @@ class AbyssScreenViewModel : ViewModel() {
 
     companion object {
         /*
-        * "历史"标签页的索引
-        * 与 tabs 数组末位保持一致;抽成常量避免各处魔法数字 9 写错
+        * ── 一级板块 ──
+        *
+        * 1.8.29 把原先平铺的 10 个标签收成 4 个板块(用户要求"合并顶部的项目"):
+        *   本期/上期            → 我的战绩(板块内切换期数)
+        *   全服总览/出场率/使用率/配队/持有率 → 全服统计
+        *   角色配装/武器装备      → 配装
+        *   历史(保持独立 —— 它是本地快照,与网络统计不同源,合并易混淆)
+        *
+        * ⚠️ 常量与映射逻辑统一定义在 [AbyssNavigation],这里只是转发别名 ——
+        *    避免两处各写一份编号而悄悄不一致。
+        *    本文件原有注释就警告过:"tab index 与 load 分支硬绑定,
+        *    插中间会让既有编号整体位移、极易漏改一处而静默串页"。
         * */
-        const val HISTORY_PAGE_INDEX = 9
+        const val SECTION_RECORD = AbyssNavigation.SECTION_RECORD
+        const val SECTION_STATISTICS = AbyssNavigation.SECTION_STATISTICS
+        const val SECTION_COLLOCATION = AbyssNavigation.SECTION_COLLOCATION
+        const val SECTION_HISTORY = AbyssNavigation.SECTION_HISTORY
+
+        // ── 全服统计的子页 ──
+        const val STAT_OVERVIEW = AbyssNavigation.STAT_OVERVIEW
+        const val STAT_APPEARANCE = AbyssNavigation.STAT_APPEARANCE
+        const val STAT_USAGE = AbyssNavigation.STAT_USAGE
+        const val STAT_TEAM = AbyssNavigation.STAT_TEAM
+        const val STAT_HOLDING = AbyssNavigation.STAT_HOLDING
+
+        // ── 配装的子页 ──
+        const val COLLOCATION_AVATAR = AbyssNavigation.COLLOCATION_AVATAR
+        const val COLLOCATION_WEAPON = AbyssNavigation.COLLOCATION_WEAPON
     }
 
-    //0本期 1上期 2总览 3出场率 4使用率 5配队 6持有率 7角色配装 8武器装备 9历史
-    var currentPageIndex by mutableIntStateOf(0)
+    var currentPageIndex by mutableIntStateOf(SECTION_RECORD)
+        private set
 
-    val tabs = arrayOf(
-        "本期", "上期", "全服总览", "出场率", "使用率", "配队", "持有率", "角色配装", "武器装备", "历史"
-    )
+    val tabs = arrayOf("我的战绩", "全服统计", "配装", "历史")
+
+    //二级子标签(仅"全服统计"与"配装"有)
+    val statisticsTabs = arrayOf("全服总览", "出场率", "使用率", "配队", "持有率")
+    val collocationTabs = arrayOf("角色配装", "武器装备")
+
+    var statisticsSubIndex by mutableIntStateOf(STAT_OVERVIEW)
+        private set
+    var collocationSubIndex by mutableIntStateOf(COLLOCATION_AVATAR)
+        private set
+
+    /*
+    * 「我的战绩」的本期/上期
+    *
+    * ⚠️ 与下面的 [lastPeriod] **刻意分开** —— 两者控制的是不同数据源:
+    *    [recordIsPrevious] 选"我的哪一期深渊记录";
+    *    [lastPeriod]       选"全服统计取哪一期"。
+    * 原先 10 标签布局下"本期/上期"本身就是两个标签页,不存在混用问题;
+    * 合并成"我的战绩"后若共用一个开关,点一下会连全服统计一起切走。
+    * */
+    var recordIsPrevious by mutableStateOf(false)
+        private set
 
     /*
     * 历史成绩快照
@@ -155,7 +199,7 @@ class AbyssScreenViewModel : ViewModel() {
                 currentUser = it
                 currentGameRole = it?.getSelectedGameRole()
 
-                load(currentPageIndex)
+                loadCurrentSection()
             }
         }
     }
@@ -188,71 +232,167 @@ class AbyssScreenViewModel : ViewModel() {
 
     fun onPageIndexChange(value: Int) {
         currentPageIndex = value
-        load(value)
+        loadCurrentSection()
+    }
+
+    //切换"全服统计"板块内的子页(全服总览/出场率/…)
+    fun onStatisticsSubIndexChange(value: Int) {
+        statisticsSubIndex = value
+        loadStatistics(value)
+    }
+
+    //切换"配装"板块内的子页(角色配装/武器装备)
+    fun onCollocationSubIndexChange(value: Int) {
+        collocationSubIndex = value
+        loadCollocation(value)
     }
 
     /*
-    * 重试当前标签页。
+    * 切换「我的战绩」的本期/上期
     *
-    * 供 ContentLoadingLayout 的错误占位按钮调用。load() 内部对每个标签页
-    * 都有"已加载则跳过"的守卫(如 `2 -> if (overview != null) return`),
+    * 只影响自己的深渊记录,不碰全服统计的期数(两者是独立开关)。
+    * */
+    fun toggleRecordPeriod() {
+        recordIsPrevious = !recordIsPrevious
+        loadRecord()
+    }
+
+    /*
+    * 重试当前板块。
+    *
+    * 供 ContentLoadingLayout 的错误占位按钮调用。各 load 函数内部都有
+    * "已加载则跳过"的守卫(如 `if (overview != null) return`),
     * 而失败时对应字段仍为 null,故重试会真正重新发起请求。
     * */
     fun retryCurrentPage() {
-        load(currentPageIndex)
+        when (currentPageIndex) {
+            SECTION_RECORD -> loadRecord()
+            SECTION_STATISTICS -> loadStatistics(statisticsSubIndex)
+            SECTION_COLLOCATION -> loadCollocation(collocationSubIndex)
+            SECTION_HISTORY -> loadHistory()
+        }
     }
 
-    //切换全服数据的本期与上期,清空已加载的比率数据重新加载
+    /*
+    * 切换全服统计的本期/上期,清空已加载的数据重新加载
+    *
+    * ⚠️ 必须把 [overview] 也置空 —— 全服总览接口本身就带 `?Last=` 参数、
+    *    数据随期数变化。1.8.28 及更早的实现漏了这一项,导致"停在全服总览页
+    *    切换本期/上期时数字不变"(load 里 `if (overview != null) return`
+    *    会直接跳过重新请求)。属本次一并修掉的既有缺陷。
+    *
+    * ⚠️ 配装两项([avatarCollocation]/[weaponCollocation])也要清 ——
+    *    它们的接口同样带 `?Last=`,原先清掉是对的,别因为"配装已挪到另一个板块"
+    *    就漏掉:期数开关对两个板块都生效。
+    *
+    * ⚠️ 不清 [holdingRate]:它固定是"本期 vs 上期环比",与期数开关无关。
+    * */
     fun togglePeriod() {
         lastPeriod = !lastPeriod
 
+        overview = null
         appearanceRate = null
         usageRate = null
         teamCombination = null
         avatarCollocation = null
         weaponCollocation = null
 
-        load(currentPageIndex)
+        //重新加载当前所在板块(两个板块都受期数影响)
+        when (currentPageIndex) {
+            SECTION_STATISTICS -> loadStatistics(statisticsSubIndex)
+            SECTION_COLLOCATION -> loadCollocation(collocationSubIndex)
+        }
     }
 
-    private fun load(page: Int) {
-        //深渊记录页
-        if (page <= 1) {
-            when (page) {
-                0 -> if (currentAbyssRecord == null) setAbyssRecord(page)
-                1 -> if (previousAbyssRecord == null) setAbyssRecord(page)
+    /*
+    * 按当前所在板块分发加载
+    *
+    * 供 init(账号流变化)与切换游戏角色后重新加载 ——
+    * 这两个时机都要"把当前可见的板块刷新一遍"。
+    * */
+    private fun loadCurrentSection() {
+        when (currentPageIndex) {
+            SECTION_RECORD -> loadRecord()
+            SECTION_STATISTICS -> loadStatistics(statisticsSubIndex)
+            SECTION_COLLOCATION -> loadCollocation(collocationSubIndex)
+            SECTION_HISTORY -> loadHistory()
+        }
+    }
+
+    /*
+    * 加载「我的战绩」(本期或上期)
+    *
+    * 由 [recordIsPrevious] 决定取哪一期,与全服统计的 [lastPeriod] 独立。
+    * */
+    private fun loadRecord() {
+        val cached = if (recordIsPrevious) previousAbyssRecord else currentAbyssRecord
+
+        if (cached == null) {
+            setAbyssRecord(recordIsPrevious)
+        }
+    }
+
+    /*
+    * 加载「全服统计」板块的子页
+    *
+    * ⚠️ 必须先过 [metadataLoaded] 守卫:出场率/使用率/配队都要用角色元数据
+    *    解析图标与名称,元数据未就绪时请求会白跑。
+    *    (全服总览本身不需要元数据,但它的兄弟子页需要,且元数据是本地文件、
+    *     加载很快,故整个板块统一等待,不做例外。)
+    * */
+    private fun loadStatistics(subIndex: Int) {
+        if (!metadataLoaded) return
+
+        //持有率固定拉"本期 vs 上期环比",与期数开关无关
+        if (subIndex == STAT_HOLDING) {
+            if (holdingRate != null) return
+
+            holdingRateLoadingState = LoadingState.Loading
+
+            viewModelScope.launch {
+                //同时拉取本期与上期用于计算环比
+                val responses = withContext(Dispatchers.IO) {
+                    statisticsClient.getHoldingRate(false) to
+                            statisticsClient.getHoldingRate(true)
+                }
+
+                val current = responses.first
+                val previous = responses.second
+
+                if (current?.retcode == 0) {
+                    val joined = joinHoldingRate(
+                        current = current.data.orEmpty(),
+                        previous = previous?.data
+                    )
+
+                    holdingRate = joined
+                    holdingRateLoadingState =
+                        if (joined.isEmpty()) LoadingState.Empty else LoadingState.Success
+                } else {
+                    holdingRateLoadingState = LoadingState.Error
+                    "获取持有率失败:${current?.message ?: "网络错误"}".errorNotify()
+                }
             }
             return
         }
 
-        //历史页:纯本地数据,不依赖元数据与网络
-        if (page == HISTORY_PAGE_INDEX) {
-            loadHistory()
-            return
+        //其余四项都随本期/上期变化
+        val cached = when (subIndex) {
+            STAT_OVERVIEW -> overview
+            STAT_APPEARANCE -> appearanceRate
+            STAT_USAGE -> usageRate
+            STAT_TEAM -> teamCombination
+            else -> null
         }
+        if (cached != null) return
 
-        //全服数据库页
-        if (!metadataLoaded) {
-            return
-        }
-
-        when (page) {
-            2 -> if (overview != null) return
-            3 -> if (appearanceRate != null) return
-            4 -> if (usageRate != null) return
-            5 -> if (teamCombination != null) return
-            6 -> if (holdingRate != null) return
-            7 -> if (avatarCollocation != null) return
-            8 -> if (weaponCollocation != null) return
-        }
-
-        setLoadingState(page, LoadingState.Loading)
+        setStatisticsLoadingState(subIndex, LoadingState.Loading)
 
         viewModelScope.launch {
             val last = lastPeriod
 
-            when (page) {
-                2 -> {
+            when (subIndex) {
+                STAT_OVERVIEW -> {
                     val response = withContext(Dispatchers.IO) {
                         statisticsClient.getOverview(last)
                     }
@@ -267,7 +407,7 @@ class AbyssScreenViewModel : ViewModel() {
                     }
                 }
 
-                3 -> {
+                STAT_APPEARANCE -> {
                     val response = withContext(Dispatchers.IO) {
                         statisticsClient.getAvatarAppearanceRate(last)
                     }
@@ -282,7 +422,7 @@ class AbyssScreenViewModel : ViewModel() {
                     }
                 }
 
-                4 -> {
+                STAT_USAGE -> {
                     val response = withContext(Dispatchers.IO) {
                         statisticsClient.getAvatarUsageRate(last)
                     }
@@ -297,7 +437,7 @@ class AbyssScreenViewModel : ViewModel() {
                     }
                 }
 
-                5 -> {
+                STAT_TEAM -> {
                     val response = withContext(Dispatchers.IO) {
                         statisticsClient.getTeamCombination(last)
                     }
@@ -311,33 +451,32 @@ class AbyssScreenViewModel : ViewModel() {
                         "获取配队数据失败:${response?.message ?: "网络错误"}".errorNotify()
                     }
                 }
+            }
+        }
+    }
 
-                6 -> {
-                    //同时拉取本期与上期用于计算环比
-                    val responses = withContext(Dispatchers.IO) {
-                        statisticsClient.getHoldingRate(false) to
-                                statisticsClient.getHoldingRate(true)
-                    }
+    /*
+    * 加载「配装」板块的子页(角色配装/武器装备)
+    *
+    * 两者都随本期/上期变化,故也吃 [lastPeriod]。
+    * */
+    private fun loadCollocation(subIndex: Int) {
+        if (!metadataLoaded) return
 
-                    val current = responses.first
-                    val previous = responses.second
+        val cached = when (subIndex) {
+            COLLOCATION_AVATAR -> avatarCollocation
+            COLLOCATION_WEAPON -> weaponCollocation
+            else -> null
+        }
+        if (cached != null) return
 
-                    if (current?.retcode == 0) {
-                        val joined = joinHoldingRate(
-                            current = current.data.orEmpty(),
-                            previous = previous?.data
-                        )
+        setCollocationLoadingState(subIndex, LoadingState.Loading)
 
-                        holdingRate = joined
-                        holdingRateLoadingState =
-                            if (joined.isEmpty()) LoadingState.Empty else LoadingState.Success
-                    } else {
-                        holdingRateLoadingState = LoadingState.Error
-                        "获取持有率失败:${current?.message ?: "网络错误"}".errorNotify()
-                    }
-                }
+        viewModelScope.launch {
+            val last = lastPeriod
 
-                7 -> {
+            when (subIndex) {
+                COLLOCATION_AVATAR -> {
                     val response = withContext(Dispatchers.IO) {
                         statisticsClient.getAvatarCollocation(last)
                     }
@@ -352,7 +491,7 @@ class AbyssScreenViewModel : ViewModel() {
                     }
                 }
 
-                8 -> {
+                COLLOCATION_WEAPON -> {
                     val response = withContext(Dispatchers.IO) {
                         statisticsClient.getWeaponCollocation(last)
                     }
@@ -396,37 +535,49 @@ class AbyssScreenViewModel : ViewModel() {
         }.sortedByDescending { it.HoldingRate }
     }
 
-    //按页设置对应的加载状态(0/1=深渊记录,2~8=统计页)
-    private fun setLoadingState(page: Int, state: LoadingState) {
-        when (page) {
-            0 -> currentAbyssRecordLoadingState = state
-            1 -> previousAbyssRecordLoadingState = state
-            2 -> overviewLoadingState = state
-            3 -> appearanceRateLoadingState = state
-            4 -> usageRateLoadingState = state
-            5 -> teamCombinationLoadingState = state
-            6 -> holdingRateLoadingState = state
-            7 -> avatarCollocationLoadingState = state
-            8 -> weaponCollocationLoadingState = state
+    //「全服统计」子页的加载状态
+    private fun setStatisticsLoadingState(subIndex: Int, state: LoadingState) {
+        when (subIndex) {
+            STAT_OVERVIEW -> overviewLoadingState = state
+            STAT_APPEARANCE -> appearanceRateLoadingState = state
+            STAT_USAGE -> usageRateLoadingState = state
+            STAT_TEAM -> teamCombinationLoadingState = state
+            STAT_HOLDING -> holdingRateLoadingState = state
         }
     }
 
-    private fun setAbyssRecord(pageIndex: Int) {
+    //「配装」子页的加载状态
+    private fun setCollocationLoadingState(subIndex: Int, state: LoadingState) {
+        when (subIndex) {
+            COLLOCATION_AVATAR -> avatarCollocationLoadingState = state
+            COLLOCATION_WEAPON -> weaponCollocationLoadingState = state
+        }
+    }
+
+    //设置「我的战绩」的加载状态
+    private fun setRecordLoadingState(isPrevious: Boolean, state: LoadingState) {
+        if (isPrevious) {
+            previousAbyssRecordLoadingState = state
+        } else {
+            currentAbyssRecordLoadingState = state
+        }
+    }
+
+    /*
+    * 拉取深渊记录
+    *
+    * ⚠️ 参数用 [isPrevious] 布尔而不是 0/1 索引:原先的 `pageIndex` 既要当
+    *    schedule_type 的下标、又要当"写哪个 LoadingState"的判据,两处含义
+    *    不同却共用同一个数字 —— 写反了编译期看不见,只表现为显示错期数。
+    * */
+    private fun setAbyssRecord(isPrevious: Boolean) {
         val state = if (currentUser == null || currentGameRole == null) {
             LoadingState.Error
         } else {
             LoadingState.Loading
         }
 
-        when (pageIndex) {
-            0 -> {
-                currentAbyssRecordLoadingState = state
-            }
-
-            1 -> {
-                previousAbyssRecordLoadingState = state
-            }
-        }
+        setRecordLoadingState(isPrevious, state)
 
         if (state == LoadingState.Error) return
 
@@ -447,7 +598,7 @@ class AbyssScreenViewModel : ViewModel() {
 
                 val result = withContext(Dispatchers.IO) {
                     gameRecordClient.getSpiralAbyssData(
-                        user = userAndUid, scheduleType = scheduleType[pageIndex]
+                        user = userAndUid, scheduleType = AbyssNavigation.scheduleTypeFor(isPrevious)
                     )
                 }
 
@@ -456,7 +607,7 @@ class AbyssScreenViewModel : ViewModel() {
                     val resultData = result.data
 
                     if (resultData == null) {
-                        setLoadingState(pageIndex, LoadingState.Error)
+                        setRecordLoadingState(isPrevious, LoadingState.Error)
                         "深渊数据为空".errorNotify()
                         return@launch
                     }
@@ -473,16 +624,12 @@ class AbyssScreenViewModel : ViewModel() {
                     //落库本期成绩快照(服务端只提供本期/上期,过期即永久丢失)
                     archiveSnapshot(data)
 
-                    when (pageIndex) {
-                        0 -> {
-                            currentAbyssRecord = data
-                            currentAbyssRecordLoadingState = resultState
-                        }
-
-                        1 -> {
-                            previousAbyssRecord = data
-                            previousAbyssRecordLoadingState = resultState
-                        }
+                    if (isPrevious) {
+                        previousAbyssRecord = data
+                        previousAbyssRecordLoadingState = resultState
+                    } else {
+                        currentAbyssRecord = data
+                        currentAbyssRecordLoadingState = resultState
                     }
                 } else {
                     var finalState = LoadingState.Error
@@ -496,7 +643,7 @@ class AbyssScreenViewModel : ViewModel() {
                         if (challenge != null) {
                             val retry = withContext(Dispatchers.IO) {
                                 gameRecordClient.getSpiralAbyssData(
-                                    user = userAndUid, scheduleType = scheduleType[pageIndex], challenge = challenge
+                                    user = userAndUid, scheduleType = AbyssNavigation.scheduleTypeFor(isPrevious), challenge = challenge
                                 )
                             }
 
@@ -512,9 +659,10 @@ class AbyssScreenViewModel : ViewModel() {
                                 //重试(风控验证)成功后同样存档
                                 archiveSnapshot(data)
 
-                                when (pageIndex) {
-                                    0 -> currentAbyssRecord = data
-                                    1 -> previousAbyssRecord = data
+                                if (isPrevious) {
+                                    previousAbyssRecord = data
+                                } else {
+                                    currentAbyssRecord = data
                                 }
                             }
                         }
@@ -528,17 +676,14 @@ class AbyssScreenViewModel : ViewModel() {
                         finalState = LoadingState.Error
                     }
 
-                    when (pageIndex) {
-                        0 -> currentAbyssRecordLoadingState = finalState
-                        1 -> previousAbyssRecordLoadingState = finalState
-                    }
+                    setRecordLoadingState(isPrevious, finalState)
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 //超时/取消:必须让界面脱离Loading,否则永久转圈
-                setLoadingState(pageIndex, LoadingState.Error)
+                setRecordLoadingState(isPrevious, LoadingState.Error)
                 throw e
             } catch (e: Exception) {
-                setLoadingState(pageIndex, LoadingState.Error)
+                setRecordLoadingState(isPrevious, LoadingState.Error)
                 "获取深渊数据时出现异常:${e.message ?: "未知错误"}".errorNotify()
             }
         }
@@ -607,7 +752,28 @@ class AbyssScreenViewModel : ViewModel() {
         currentUser = user
         currentGameRole = role
 
-        load(currentPageIndex)
+        /*
+        * ⚠️ 切换游戏角色必须**清掉角色相关的缓存**再加载。
+        *
+        * 原先这里直接调 load(),而 load 里是
+        * `0 -> if (currentAbyssRecord == null) setAbyssRecord(page)`
+        * —— 已经加载过就跳过。于是**从角色 A 切到角色 B 时,
+        * "我的战绩"仍显示 A 的深渊记录**(数据属于上一个角色却没有任何提示)。
+        * 本次一并修掉。
+        *
+        * 清哪些:
+        *   - 本期/上期深渊记录 + 历史(都是"这个角色的"数据,必须重取)
+        * 不清哪些:
+        *   - 全服统计与配装:那是**全服**数据,与当前角色无关,清掉纯属浪费请求。
+        * */
+        currentAbyssRecord = null
+        previousAbyssRecord = null
+        abyssHistory = emptyList()
+        currentAbyssRecordLoadingState = LoadingState.Loading
+        previousAbyssRecordLoadingState = LoadingState.Loading
+        historyLoadingState = LoadingState.Loading
+
+        loadCurrentSection()
     }
 
     fun goValidateScreen() {
