@@ -4,6 +4,7 @@ import com.lianyi.paimonsnotebook.common.web.static_resources.StaticResourceSour
 import okhttp3.Interceptor
 import okhttp3.Response
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /*
 * 静态资源图片加载的**多源重试**拦截器
@@ -12,9 +13,9 @@ import java.io.IOException
 * `static.snaphutaorp.org` 实测单张 72KB 图标耗时 21.8s~137.5s、甚至 60s 超时,
 * 而本机带宽正常(同期 npmmirror 1862 KB/s)。
 *
-* ## 本次修的两个真实缺陷(原实现)
+* ## 修过的缺陷
 *
-* ### ① 超时不触发兜底(最关键)
+* ### ① 超时不触发兜底(原实现)
 * 原实现是:
 * ```
 * val response = chain.proceed(request)          // 超时时这里直接抛异常
@@ -28,6 +29,38 @@ import java.io.IOException
 * enka 实测 7.9s / 23.6s / 12.7s。现在先试**路径结构完全一致**的镜像
 * (`static.hutaorp.org`,实测 4.1s),enka 退为最后一档,并按分类过滤。
 *
+* ### ③ ⚠️ 兜底仍拿不到时间(1.8.29 实测发现)
+*
+* **尽管 ① 修好了"能走到兜底",兜底依然会失败** —— 原因是
+* `applicationOkHttpClient` 上设了 `callTimeout(60s)`,而 **callTimeout 覆盖
+* 整次 call(含拦截器里的所有 `proceed()` 尝试)**,不是"每次尝试各 60s"。
+*
+* 用真实 OkHttp(4.12.0)写探针复现(把 60s 等比缩小到 3s):
+*
+* ```
+*   callTimeout=3s, readTimeout=3s
+*   尝试 /primary.png(挂起不响应) -> SocketException after 3012ms   ← 吃光预算
+*   尝试 /mirror.png              -> IOException: Canceled after 0ms  ← 0ms 被取消
+*   RESULT: InterruptedIOException: timeout
+* ```
+*
+* ⇒ **主图床一挂,镜像就永远轮不到**,而"主图床挂起"正是本拦截器存在的理由。
+*    这个缺陷对用户表现为:**图还是加载不出来**,与修 ① 之前没有区别。
+*
+* **修法**:给每次尝试设**独立的、远小于 callTimeout 的 readTimeout**
+* (`chain.withReadTimeout(...)`),让挂起的那次快速失败、把预算留给后续候选。
+* 同一探针验证(perAttempt=4s):
+*
+* ```
+*   尝试 /primary.png -> SocketTimeoutException after 4031ms   ← 快速失败
+*   尝试 /mirror.png  -> HTTP 200 in 0ms                       ← 兜底成功
+*   RESULT: HTTP 200  (total 4046ms)
+* ```
+*
+* 4s 这个数字的依据:镜像 `static.hutaorp.org` 实测最慢约 12.1s、但中位数 1.0s,
+* 主图床正常时也在 1~5s;取 8s 既容得下正常波动,又能保证 3 个候选
+* (8×3=24s)在 60s callTimeout 内跑完。
+*
 * ## 设计约束
 *
 *   - **只对静态资源生效**:host 不是主图床的请求(用户帖子里外链的图、
@@ -40,6 +73,24 @@ import java.io.IOException
 *     (真机日志是本项目排查图床问题的唯一手段)。
 * */
 object ImageFallbackInterceptor : Interceptor {
+
+    /*
+    * 单次尝试的读超时(毫秒)
+    *
+    * ⚠️ 必须**远小于** `applicationOkHttpClient` 的 callTimeout(60s),
+    *    否则第一个候选会把预算吃光(见类注释 ③ 的探针数据)。
+    *
+    * 用 internal 暴露给测试:这个数字与 callTimeout 的**大小关系**是
+    * 兜底能否生效的前提,写成断言比靠注释可靠。
+    * */
+    internal const val PER_ATTEMPT_READ_TIMEOUT_MILLIS = 8_000
+
+    /*
+    * 单次尝试的连接超时(毫秒)
+    *
+    * 连接阶段挂起与"连上但不发数据"是两种不同的卡法,都要各自设短超时。
+    * */
+    internal const val PER_ATTEMPT_CONNECT_TIMEOUT_MILLIS = 5_000
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -66,7 +117,18 @@ object ImageFallbackInterceptor : Interceptor {
                     request.newBuilder().url(candidateUrl).build()
                 }
 
-                val response = chain.proceed(attempt)
+                /*
+                * ⚠️ 每次尝试都设**独立的短超时**。
+                *
+                * 不能依赖 client 上的 readTimeout(60s) + callTimeout(60s):
+                * 那个预算被整次 call 共享,第一个挂起的候选会把它全吃掉,
+                * 后续候选在 0ms 被取消(已用 OkHttp 4.12.0 探针实证)。
+                * */
+                val attemptChain = chain
+                    .withReadTimeout(PER_ATTEMPT_READ_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+                    .withConnectTimeout(PER_ATTEMPT_CONNECT_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+
+                val response = attemptChain.proceed(attempt)
 
                 if (response.isSuccessful) {
                     return response
