@@ -219,7 +219,23 @@ class WeaponScreenViewModel : ItemBaseViewModel<WeaponData>() {
 
         val weapon = currentItem ?: return
 
-        //TODO 适配武器等级为100
+        /*
+        * 这里原先挂着一个 `//TODO 适配武器等级为100`,已删除 —— 它基于**错误前提**。
+        *
+        * 依据(详细推导见 `LevelLimit.kt` 的注释):
+        *   - 角色上限确实已提到 **100**(需新材料「无主的命星」做 95/100 阶突破)
+        *   - 但武器上限仍是 **90 / 70**,取值与维护活跃的同源实现胡桃
+        *     `GetMaxLevelByQuality()` 一致 ⇒ **两者刻意不对称,不要一起改**
+        *
+        * ⚠️ 容易被误判的一点:`WeaponCurve.json` 里**确实有 Level 1..100 的曲线**,
+        *    看着像"武器也能到 100"。但 `AvatarCurve.json` 同样有 100 档,
+        *    而 `WeaponPromote.json` 与 `AvatarPromote.json` 的突破档位都是 0..6
+        *    —— 即**曲线文件是按 100 档统一下发的,不代表游戏内上限是 100**。
+        *
+        * 故这里取 `weapon.maxLevel`(委托 `LevelLimit.weaponMaxLevel(rankLevel)`)是对的。
+        * 若日后官方确实放开武器 100 级,应**同时**改 `LevelLimit.weaponMaxLevel`
+        * 与武器计算路径,而不是只改这一个滑块。
+        * */
         val weaponMaxLevel = weapon.maxLevel
 
         cultivateConfigList += CultivateConfigData(

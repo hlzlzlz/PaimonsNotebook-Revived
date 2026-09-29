@@ -22,6 +22,7 @@ import com.lianyi.paimonsnotebook.ui.widgets.common.extensions.setTextColor
 import com.lianyi.paimonsnotebook.ui.widgets.core.BaseRemoteViews
 import com.lianyi.paimonsnotebook.ui.widgets.remoteviews.state.ErrorRemoteViews
 import com.lianyi.paimonsnotebook.ui.widgets.util.AppWidgetHelper
+import com.lianyi.paimonsnotebook.ui.widgets.util.AppWidgetPageMath
 import com.lianyi.paimonsnotebook.ui.widgets.widget.AppWidgetCommon3X2
 import java.time.LocalDateTime
 
@@ -48,8 +49,17 @@ class DailyMaterial3X2RemoteViews(
         }
 
         dataStoreValuesFirst {
-            val tempValue =
+            val intentPage =
                 intent?.getIntExtra(AppWidgetHelper.PARAM_SHORTCUT_CURRENT_PAGE, -1) ?: -1
+
+            /*
+            * ⚠️ 必须读**本组件自己的**键(AppWidgetDailyMaterialCurrentPage)。
+            *
+            * 原实现读的是 `AppWidgetShortcutCurrentPage`(「快捷启动」的键),
+            * 写的是自己的键 ⇒ **读写不对称**,自己存的页号永远读不回来,
+            * 实际效果是两个组件共用一个读源(快捷启动翻页会让材料组件跟着跳)。
+            * */
+            val storedPage = it[PreferenceKeys.AppWidgetDailyMaterialCurrentPage] ?: 0
 
             val pair = Materials.getMaterialsIdByWeek(
                 week = LocalDateTime.now().dayOfWeek.value,
@@ -58,20 +68,10 @@ class DailyMaterial3X2RemoteViews(
             val items = materialService.getMaterialListByIds(pair.first)
                 .filter { material -> material.RankLevel == QualityType.QUALITY_PURPLE || material.RankLevel == QualityType.QUALITY_ORANGE }
 
-            val maxPage = items.size / count + if (items.size % count == 0) 0 else 1
-
-            val page = if (tempValue < 0 || tempValue >= maxPage) {
-                val tv = it[PreferenceKeys.AppWidgetShortcutCurrentPage] ?: 0
-
-                if (tv < 0 || tv >= maxPage) 0 else tv
-            } else {
-                tempValue
-            }
+            val maxPage = AppWidgetPageMath.pageCount(items.size, count)
+            val page = AppWidgetPageMath.resolvePage(intentPage, storedPage, maxPage)
 
             PreferenceKeys.AppWidgetDailyMaterialCurrentPage.editValue(page)
-
-            val start = (if (page >= maxPage) 0 else page) * count
-            val end = start + count
 
             setOnClickPendingIntent(
                 R.id.next,
@@ -83,7 +83,8 @@ class DailyMaterial3X2RemoteViews(
             setTextViewText(R.id.page_text, "${page + 1}/${maxPage}")
             setTextViewText(R.id.text, "今天是[${TimeHelper.getWeekName(week = pair.second)}]")
 
-            val list = items.subList(start, if (end >= items.size) items.size else end)
+            //越界安全(与快捷启动组件同一处理,详见 AppWidgetPageMath 注释)
+            val list = AppWidgetPageMath.sliceForPage(items, page, count)
 
             loadImage(
                 urls = items.map { material -> material.iconUrl }.toTypedArray(),

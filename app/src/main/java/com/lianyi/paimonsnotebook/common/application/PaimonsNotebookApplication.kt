@@ -208,7 +208,6 @@ class PaimonsNotebookApplication : Application(), ImageLoaderFactory {
     private fun executeDiskCachePlanDelete() {
         //用launchSafeIO:本方法在Application.onCreate中调用,裸launch抛异常会杀进程
         launchSafeIO {
-            //TODO 目前已知删除disckCache文件会导致删除图片再次缓存图片,再从本地读取缓存为null
             launchIO {
                 val autoClean = dataStoreValuesFirstLambda {
                     this[PreferenceKeys.EnableAutoCleanExpiredImages] ?: true
@@ -219,9 +218,29 @@ class PaimonsNotebookApplication : Application(), ImageLoaderFactory {
                 PaimonsNotebookDatabase.database.diskCacheDao.apply {
                     updateAllDataPlanDeleteStatus(System.currentTimeMillis(), deleteTimeStampLimit)
 
+                    /*
+                    * ⚠️ 必须走 Coil 的 DiskCache.remove(),**不能直接 File.delete()**。
+                    *
+                    * 这里原先是:
+                    * ```
+                    * PaimonsNotebookImageLoader.getCacheImageFileByUrl(it.url)?.delete()
+                    * PaimonsNotebookImageLoader.getCacheImageMetadataFileByUrl(it.url)?.delete()
+                    * ```
+                    * 而 `image_cache/` 目录是 **Coil 的 DiskLruCache** 在管
+                    * (见本类 `newImageLoader()` 的 `diskCache(imageCache)`)。
+                    * 它的文件名虽然确实等于 `sha256(url).hex()` + `.0`/`.1`
+                    * (与 `PaimonsNotebookImageLoader` 的算法一致,故删的是同一批文件),
+                    * 但 **DiskLruCache 还维护一份 journal**:
+                    *   - 绕过 API 直接删文件 ⇒ journal 仍认为该条目存在
+                    *   - 之后 Coil 读到"有记录但文件没了"的条目 ⇒ 当作损坏
+                    *   - 表现为**同一张图被反复重新下载**,而本地读取又拿不到
+                    *     (即原 TODO 描述的"删除后再次缓存、再从本地读取为 null")
+                    * 这正是 `diskCache.remove(key)` 存在的原因:它同时更新 journal。
+                    *
+                    * key 用 url:与 `getImageRequest` 里的 `.diskCacheKey(url)` 保持一致。
+                    * */
                     getPlanDeleteData().first().forEach {
-                        PaimonsNotebookImageLoader.getCacheImageFileByUrl(it.url)?.delete()
-                        PaimonsNotebookImageLoader.getCacheImageMetadataFileByUrl(it.url)?.delete()
+                        imageCache.remove(it.url)
                     }
 
                     removeAllPlanDeleteData()
